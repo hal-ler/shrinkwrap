@@ -1,0 +1,329 @@
+From de8703712030ae830b595e112675971cf4fff7cc Mon Sep 17 00:00:00 2001
+From: Istvan Haller <ihaller@ihr210-laptop.site>
+Date: Sun, 15 Feb 2015 23:33:25 +0100
+Subject: [PATCH 1/4] Fixed call-site type inference.
+
+---
+ gcc/cp/call.c       | 85 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ gcc/cp/class.c      | 34 ++++++++++++++++----
+ gcc/cp/cp-tree.h    |  2 +-
+ gcc/vtable-verify.c | 90 +++++++++++++++++++++++++++++++----------------------
+ 4 files changed, 166 insertions(+), 45 deletions(-)
+
+diff --git a/gcc/cp/call.c b/gcc/cp/call.c
+index 709b6be..6ca5c2b 100644
+--- a/gcc/cp/call.c
++++ b/gcc/cp/call.c
+@@ -6734,6 +6734,83 @@ mark_versions_used (tree fn)
+     }
+ }
+ 
++/* Find the offset of the first VTable that extends
++   type  */
++static tree find_offset(tree binfo, tree type)
++{
++  if (TYPE_MAIN_VARIANT (BINFO_TYPE (binfo)) == type)
++    {
++      if (!BINFO_VTABLE (binfo))
++        return NULL_TREE;
++      else
++        return BINFO_OFFSET (binfo);
++    }
++  unsigned ix;
++  tree base_binfo;
++  for (ix = 0; BINFO_BASE_ITERATE (binfo, ix, base_binfo); ix++)
++    {
++      // Match with the primary parent, return the offset of the current binfo
++      if (BINFO_PRIMARY_P (base_binfo) && !BINFO_VIRTUAL_P (base_binfo) && (TYPE_MAIN_VARIANT (BINFO_TYPE (base_binfo)) == type))
++        {
++          return BINFO_OFFSET (binfo);
++        }
++      tree offset = find_offset(base_binfo, type);
++      if (offset != NULL_TREE)
++          return offset;
++    }
++  return NULL_TREE;
++}
++
++/* Recursively find the lowest VTable that matches given offset  */
++static tree find_closest_vtable_rec(tree binfo, tree offset)
++{
++  unsigned ix;
++  tree base_binfo;
++  
++  for (ix = 0; BINFO_BASE_ITERATE (binfo, ix, base_binfo); ix++)
++    {
++      if (((!BINFO_PRIMARY_P (base_binfo)
++           && BINFO_VTABLE (base_binfo))
++           || BINFO_VIRTUAL_P (base_binfo))
++           && BINFO_OFFSET (base_binfo) == offset)
++        return TYPE_MAIN_VARIANT(BINFO_TYPE (base_binfo));
++      tree type = find_closest_vtable_rec(base_binfo, offset);
++      if (type != NULL_TREE)
++        return type;
++    }
++  return NULL_TREE;
++}
++
++/* Find the lowest VTable type that extends the parent_type.  */
++static tree find_closest_vtable(tree base_type, tree binfo, tree parent_type)
++{
++  // The current type is exactly the searched one, return it
++  if (TYPE_MAIN_VARIANT(base_type) == TYPE_MAIN_VARIANT(parent_type))
++    return base_type;
++  // Find the VTable offset of the given parent_type
++  tree offset = find_offset(binfo, parent_type);
++  // No offset means that no explicit VTable is based on parent_type
++  // Use implicit VTable of parent_type
++  if (offset == NULL_TREE)
++      return parent_type;
++  // Return the base type if matching offset comes from primary parent
++  if (BINFO_OFFSET (binfo) == offset)
++    {
++      unsigned ix;
++      tree base_binfo;
++      for (ix = 0; BINFO_BASE_ITERATE (binfo, ix, base_binfo); ix++)
++        {
++          if (BINFO_PRIMARY_P (base_binfo)
++             && !BINFO_VIRTUAL_P (base_binfo)
++             && BINFO_OFFSET (base_binfo) == offset)
++            return base_type;
++        }
++    }
++  
++  // Find the lowest VTable corresponding to the offset
++  return find_closest_vtable_rec(binfo, offset);
++}
++
+ /* Subroutine of the various build_*_call functions.  Overload resolution
+    has chosen a winning candidate CAND; build up a CALL_EXPR accordingly.
+    ARGS is a TREE_LIST of the unconverted arguments to the call.  FLAGS is a
+@@ -7220,6 +7297,12 @@ build_over_call (struct z_candidate *cand, int flags, tsubst_flags_t complain)
+ 	 functions can't be constexpr.  */
+       && !in_template_function ())
+     {
++      /* Attempt to infer original call-site types.  */
++      tree casted_type = TYPE_MAIN_VARIANT (TREE_TYPE(TREE_TYPE (argarray[0])));
++      tree original_type = TYPE_MAIN_VARIANT (TREE_TYPE(source_type (convs[0])));
++      tree vtable_type = TYPE_MAIN_VARIANT (
++        find_closest_vtable(original_type, TYPE_BINFO (original_type),
++                           casted_type));
+       tree t;
+       tree binfo = lookup_base (TREE_TYPE (TREE_TYPE (argarray[0])),
+ 				DECL_CONTEXT (fn),
+@@ -7239,7 +7322,7 @@ build_over_call (struct z_candidate *cand, int flags, tsubst_flags_t complain)
+       if (DECL_CONTEXT (fn) && TYPE_JAVA_INTERFACE (DECL_CONTEXT (fn)))
+ 	fn = build_java_interface_fn_ref (fn, argarray[0]);
+       else
+-	fn = build_vfn_ref (argarray[0], DECL_VINDEX (fn));
++	fn = build_vfn_ref (argarray[0], DECL_VINDEX (fn), original_type, vtable_type);
+       TREE_TYPE (fn) = t;
+     }
+   else
+diff --git a/gcc/cp/class.c b/gcc/cp/class.c
+index 042a43d..ffe736f 100644
+--- a/gcc/cp/class.c
++++ b/gcc/cp/class.c
+@@ -136,7 +136,7 @@ static int resort_method_name_cmp (const void *, const void *);
+ static void add_implicitly_declared_members (tree, tree*, int, int);
+ static tree fixed_type_or_null (tree, int *, int *);
+ static tree build_simple_base_path (tree expr, tree binfo);
+-static tree build_vtbl_ref_1 (tree, tree);
++static tree build_vtbl_ref_1 (tree, tree, tree, tree);
+ static void build_vtbl_initializer (tree, tree, tree, tree, int *,
+ 				    vec<constructor_elt, va_gc> **);
+ static int count_fields (tree);
+@@ -662,7 +662,7 @@ build_vfield_ref (tree datum, tree type)
+    creating extra tree nodes when we don't have to.  */
+ 
+ static tree
+-build_vtbl_ref_1 (tree instance, tree idx)
++build_vtbl_ref_1 (tree instance, tree idx, tree original_type, tree vtable_type)
+ {
+   tree aref;
+   tree vtbl = NULL_TREE;
+@@ -686,16 +686,37 @@ build_vtbl_ref_1 (tree instance, tree idx)
+   if (!vtbl)
+     vtbl = build_vfield_ref (instance, basetype);
+ 
+-  aref = build_array_ref (input_location, vtbl, idx);
++  /* Generate temporary variable to contain vtbl ptr
++     as signal for type information   */
++  tree mangled_orig_name = DECL_ASSEMBLER_NAME ( TYPE_NAME(original_type));
++  const char *mangled_orig_name_str = IDENTIFIER_POINTER(mangled_orig_name);
++  tree mangled_vtbl_name = DECL_ASSEMBLER_NAME ( TYPE_NAME(vtable_type));
++  const char *mangled_vtbl_name_str = IDENTIFIER_POINTER(mangled_vtbl_name);
++  char *vptr_name;
++  vptr_name = (char *) xmalloc(strlen(mangled_orig_name_str) + strlen(mangled_vtbl_name_str) + 50);
++  sprintf(vptr_name, "_vtbl_%d_%s_%d_%s_",
++    (int)strlen(mangled_orig_name_str),
++    mangled_orig_name_str,
++    (int)strlen(mangled_vtbl_name_str),
++    mangled_vtbl_name_str);
++  tree vtbl_decl = build_decl (input_location, VAR_DECL,
++		    get_identifier (vptr_name), TREE_TYPE (vtbl));
++  tree vtbl_expr = build_x_modify_expr (input_location, vtbl_decl,
++					  INIT_EXPR,
++					  vtbl,
++					  tf_warning_or_error);
++  aref = build_array_ref (input_location, vtbl_expr, idx);
+   TREE_CONSTANT (aref) |= TREE_CONSTANT (vtbl) && TREE_CONSTANT (idx);
+ 
++  free(vptr_name);
++
+   return aref;
+ }
+ 
+ tree
+ build_vtbl_ref (tree instance, tree idx)
+ {
+-  tree aref = build_vtbl_ref_1 (instance, idx);
++  tree aref = build_vtbl_ref_1 (instance, idx, TREE_TYPE (instance), TREE_TYPE (instance));
+ 
+   return aref;
+ }
+@@ -704,13 +725,14 @@ build_vtbl_ref (tree instance, tree idx)
+    yields a function pointer corresponding to vtable element INDEX.  */
+ 
+ tree
+-build_vfn_ref (tree instance_ptr, tree idx)
++build_vfn_ref (tree instance_ptr, tree idx, tree original_type, tree vtable_type)
+ {
+   tree aref;
+ 
+   aref = build_vtbl_ref_1 (cp_build_indirect_ref (instance_ptr, RO_NULL,
+                                                   tf_warning_or_error), 
+-                           idx);
++                           idx,
++                           original_type, vtable_type);
+ 
+   /* When using function descriptors, the address of the
+      vtable entry is treated as a function pointer.  */
+diff --git a/gcc/cp/cp-tree.h b/gcc/cp/cp-tree.h
+index d149810..98e4c5a 100644
+--- a/gcc/cp/cp-tree.h
++++ b/gcc/cp/cp-tree.h
+@@ -5106,7 +5106,7 @@ extern tree convert_to_base			(tree, tree, bool, bool,
+ 						 tsubst_flags_t);
+ extern tree convert_to_base_statically		(tree, tree);
+ extern tree build_vtbl_ref			(tree, tree);
+-extern tree build_vfn_ref			(tree, tree);
++extern tree build_vfn_ref			(tree, tree, tree, tree);
+ extern tree get_vtable_decl			(tree, int);
+ extern void resort_type_method_vec		(void *, void *,
+ 						 gt_pointer_operator, void *);
+diff --git a/gcc/vtable-verify.c b/gcc/vtable-verify.c
+index 4e4c21a..b3cfa20 100644
+--- a/gcc/vtable-verify.c
++++ b/gcc/vtable-verify.c
+@@ -443,45 +443,47 @@ is_vtable_assignment_stmt (gimple stmt)
+     return true;
+ }
+ 
+-/* This function attempts to recover the declared class of an object
+-   that is used in making a virtual call.  We try to get the type from
+-   the type cast in the gimple assignment statement that extracts the
+-   vtable pointer from the object (DEF_STMT).  The gimple statement
+-   usually looks something like this:
+-
+-   D.2201_4 = MEM[(struct Event *)this_1(D)]._vptr.Event    */
+-
+-static tree
+-extract_object_class_type (tree rhs)
++/* Extract the call-site type and VTable type from the encoded temporary variable name.  */
++static void
++extract_class_type_from_string (const char *str, tree *class_type, tree *vtable_type)
+ {
+-  tree result = NULL_TREE;
+-
+-  /* Try to find and extract the type cast from that stmt.  */
+-  if (TREE_CODE (rhs) == COMPONENT_REF)
++  int class_str_len;
++  char *class_str;
++  int vtable_str_len;
++  char *vtable_str;
++  int pos;
++
++  sscanf(str, "%d_%n", &class_str_len, &pos);
++  str += pos;
++  class_str = (char *) xmalloc(class_str_len + 1);
++  strncpy(class_str, str, class_str_len);
++  class_str[class_str_len] = '\0';
++
++  str += class_str_len + 1;
++
++  sscanf(str, "%d_%n", &vtable_str_len, &pos);
++  str += pos;
++  vtable_str = (char *) xmalloc(vtable_str_len + 1);
++  strncpy(vtable_str, str, vtable_str_len);
++  vtable_str[vtable_str_len] = '\0';
++
++  *class_type =  NULL_TREE;
++  *vtable_type = NULL_TREE;
++
++  unsigned i;
++  for (i = 0; i < num_vtable_map_nodes; ++i)
+     {
+-      tree op0 = TREE_OPERAND (rhs, 0);
+-      tree op1 = TREE_OPERAND (rhs, 1);
+-
+-      if (TREE_CODE (op1) == FIELD_DECL
+-          && DECL_VIRTUAL_P (op1))
+-        {
+-          if (TREE_CODE (op0) == COMPONENT_REF
+-              && TREE_CODE (TREE_OPERAND (op0, 0)) == MEM_REF
+-              && TREE_CODE (TREE_TYPE (TREE_OPERAND (op0, 0)))== RECORD_TYPE)
+-            result = TREE_TYPE (TREE_OPERAND (op0, 0));
+-          else
+-            result = TREE_TYPE (op0);
+-        }
+-      else if (TREE_CODE (op0) == COMPONENT_REF)
+-        {
+-          result = extract_object_class_type (op0);
+-          if (result == NULL_TREE
+-              && TREE_CODE (op1) == COMPONENT_REF)
+-            result = extract_object_class_type (op1);
+-        }
++      struct vtbl_map_node *current = vtbl_map_nodes_vec[i];
++      tree base_class = current->class_info->class_type;
++      tree base_class_name = DECL_ASSEMBLER_NAME ( TYPE_NAME (base_class));
++      const char *base_class_name_str = IDENTIFIER_POINTER (base_class_name);
++      if (strcmp (base_class_name_str, class_str) == 0)
++        *class_type = base_class;
++      if (strcmp (base_class_name_str, vtable_str) == 0)
++        *vtable_type = base_class;
+     }
+ 
+-  return result;
++  return;
+ }
+ 
+ /* This function traces forward through the def-use chain of an SSA
+@@ -613,8 +615,22 @@ verify_bb_vtables (basic_block bb)
+              we need to find the statically declared type of
+              the object, so we can find and use the right
+              vtable map variable in the verification call.  */
+-          tree class_type = extract_object_class_type
+-                                                   (gimple_assign_rhs1 (stmt));
++          tree class_type;
++          tree vtable_type;
++          bool foundInLhs = false;
++          if (SSA_NAME_IDENTIFIER(gimple_assign_lhs (stmt)) != NULL_TREE)
++           {
++              const char *vtbl_name = IDENTIFIER_POINTER ( SSA_NAME_IDENTIFIER(gimple_assign_lhs (stmt)));
++              if (strncmp(vtbl_name, "_vtbl_", strlen("_vtbl_")) == 0)
++                {
++                  extract_class_type_from_string(vtbl_name + strlen("_vtbl_"), &class_type, &vtable_type);
++                  foundInLhs = true;
++                }
++            }
++          if (!foundInLhs)
++            {
++              continue;
++            }
+ 
+           gsi_vtbl_assign = gsi_for_stmt (stmt);
+ 
+-- 
+2.6.0
+

@@ -1,0 +1,598 @@
+From 2db6e920fffb88853592ad909b5fce173de95727 Mon Sep 17 00:00:00 2001
+From: Istvan Haller <ihaller@ihr210-laptop.site>
+Date: Wed, 18 Feb 2015 13:07:48 +0100
+Subject: [PATCH 2/4] Extended protection.
+
+---
+ gcc/cp/vtable-class-hierarchy.c | 416 +++++++++++++++++++++++-----------------
+ gcc/vtable-verify.c             |   8 +
+ gcc/vtable-verify.h             |   8 +
+ 3 files changed, 257 insertions(+), 175 deletions(-)
+
+diff --git a/gcc/cp/vtable-class-hierarchy.c b/gcc/cp/vtable-class-hierarchy.c
+index 6da17c7..8303111 100644
+--- a/gcc/cp/vtable-class-hierarchy.c
++++ b/gcc/cp/vtable-class-hierarchy.c
+@@ -428,45 +428,6 @@ vtv_compute_class_hierarchy_transitive_closure (void)
+     }
+ }
+ 
+-/* Keep track of which pairs we have already created __VLTRegisterPair
+-   calls for, to prevent creating duplicate calls within the same
+-   compilation unit.  VTABLE_DECL is the var decl for the vtable of
+-   the (descendant) class that we are adding to our class hierarchy
+-   data.  VPTR_ADDRESS is an expression for calculating the correct
+-   offset into the vtable (VTABLE_DECL).  It is the actual vtable
+-   pointer address that will be stored in our list of valid vtable
+-   pointers for BASE_CLASS.  BASE_CLASS is the record_type node for
+-   the base class to whose hiearchy we want to add
+-   VPTR_ADDRESS. (VTABLE_DECL should be the vtable for BASE_CLASS or
+-   one of BASE_CLASS' descendents.  */
+-
+-static bool
+-check_and_record_registered_pairs (tree vtable_decl, tree vptr_address,
+-                                   tree base_class)
+-{
+-  unsigned offset;
+-  struct vtbl_map_node *base_vtable_map_node;
+-  bool inserted_something = false;
+-
+-
+-  if (TREE_CODE (vptr_address) == ADDR_EXPR
+-      && TREE_CODE (TREE_OPERAND (vptr_address, 0)) == MEM_REF)
+-    vptr_address = TREE_OPERAND (vptr_address, 0);
+-
+-  if (TREE_OPERAND_LENGTH (vptr_address) > 1)
+-    offset = TREE_INT_CST_LOW (TREE_OPERAND (vptr_address, 1));
+-  else
+-    offset = 0;
+-
+-  base_vtable_map_node = vtbl_map_get_node (TYPE_MAIN_VARIANT (base_class));
+-
+-  inserted_something = vtbl_map_node_registration_insert
+-                                                        (base_vtable_map_node,
+-                                                         vtable_decl,
+-                                                         offset);
+-  return !inserted_something;
+-}
+-
+ /* Given an IDENTIFIER_NODE, build and return a string literal based on it.  */
+ 
+ static tree
+@@ -480,6 +441,76 @@ build_string_from_id (tree identifier)
+   return build_string_literal (len + 1, IDENTIFIER_POINTER (identifier));
+ }
+ 
++/* Recursively check if a VTable is a parent of the one in the descendant.
++   For non-virtual VTables there must exist a path between:
++     desc_class->base_class->vtable_class including desc_vtable_class
++   The binfo corresponding to vtable_class in the descendant must
++   still match the desc_vtable_binfo (based on the VTable offset)
++   If the inheritance chain includes virtual inheritance, then
++   VTT entries must also match. */
++
++static bool find_vtable_match_rec(tree base_class,
++                              tree vtable_class,
++                              tree desc_vtable_class,
++                              tree offset,
++                              tree offset2,
++                              tree binfo,
++                              bool on_base_path,
++                              bool on_vtable_path,
++                              bool is_last_vtable_match)
++{
++  // Check if curret inheritance path includes base_class
++  if (TYPE_MAIN_VARIANT (BINFO_TYPE (binfo)) == base_class)
++    on_base_path = true;
++  // Check if current inheritance path includes desc_vtable_class
++  if (TYPE_MAIN_VARIANT (BINFO_TYPE (binfo)) == desc_vtable_class)
++    on_vtable_path = true;
++  // Check if last virtual inheritance is a match
++  // Virtual inheritance matches if the VTT entry matches
++  if (BINFO_VPTR_INDEX (binfo) != NULL)
++    is_last_vtable_match = (BINFO_VPTR_INDEX (binfo) == offset2);
++  // A binfo of type vtable_class found, check if its VTable still
++  // matches desc_vtable_binfo based on offset
++  if (TYPE_MAIN_VARIANT (BINFO_TYPE (binfo)) == vtable_class &&
++      BINFO_OFFSET (binfo) == offset &&
++      (offset2 == NULL_TREE || is_last_vtable_match))
++    return on_base_path & on_vtable_path;
++  
++  bool found = false;
++  unsigned ix;
++  tree base_binfo;
++  for (ix = 0; BINFO_BASE_ITERATE (binfo, ix, base_binfo); ix++)
++    {
++      found |= find_vtable_match_rec(base_class,
++                                     vtable_class,
++                                     desc_vtable_class,
++                                     offset,
++                                     offset2,
++                                     base_binfo,
++                                     on_base_path,
++                                     on_vtable_path,
++                                     is_last_vtable_match);
++    }
++  return found;
++}
++
++/* Check if give VTable is a parent of the one in the descendant.  */
++
++static bool find_vtable_match(tree base_class,
++                              tree vtable_class,
++                              tree desc_base_class,
++                              tree desc_vtable_class,
++                              tree desc_vtable_binfo)
++{
++  return find_vtable_match_rec(base_class,
++                    vtable_class, 
++                    desc_vtable_class,
++                    BINFO_OFFSET (desc_vtable_binfo), 
++                    BINFO_VPTR_INDEX (desc_vtable_binfo), 
++                    TYPE_BINFO (desc_base_class),
++                    false, false, true);
++}
++
+ /* A class may contain secondary vtables in it, for various reasons.
+    This function goes through the decl chain of a class record looking
+    for any fields that point to secondary vtables, and adding calls to
+@@ -494,7 +525,10 @@ build_string_from_id (tree identifier)
+    adding our calls to __VLTRegisterPair.  */
+ 
+ static void
+-register_construction_vtables (tree base_class, tree record_type,
++register_construction_vtables (tree base_class,
++                               tree vtable_class,
++                               tree record_type,
++                               struct vtbl_map_node *vtbl_class_node,
+                                vec<tree> *vtable_ptr_array)
+ {
+   tree vtbl_var_decl;
+@@ -504,80 +538,63 @@ register_construction_vtables (tree base_class, tree record_type,
+ 
+   vtbl_var_decl = CLASSTYPE_VTABLES (record_type);
+ 
+-  if (CLASSTYPE_VBASECLASSES (record_type))
+-    {
+-      tree vtt_decl;
+-      bool already_registered = false;
+-      tree val_vtbl_decl = NULL_TREE;
++  if (!CLASSTYPE_VBASECLASSES (record_type))
++    return;
++  tree vtt_decl;
+ 
+-      vtt_decl = DECL_CHAIN (vtbl_var_decl);
++  vtt_decl = DECL_CHAIN (vtbl_var_decl);
+ 
+-      /* Check to see if we have found a VTT.  Add its data if appropriate.  */
+-      if (vtt_decl)
++  /* Check to see if we have found a VTT.  Add its data if appropriate.  */
++  if (!vtt_decl)
++    return;
++
++  tree values = DECL_INITIAL (vtt_decl);
++  if (!(TREE_ASM_WRITTEN (vtt_decl)
++        && values != NULL_TREE
++        && TREE_CODE (values) == CONSTRUCTOR
++        && TREE_CODE (TREE_TYPE (values)) == ARRAY_TYPE))
++    return;
++
++  // Traverse all potential sub-VTTs of given descendant
++  constructor_elt *ce;
++  unsigned vtbl_it;
++  unsigned vtbl_it_end = (vtbl_class_node->vtbl_map_subvttbinfos).length();
++  for (vtbl_it = 0; vtbl_it < vtbl_it_end;
++                   ++vtbl_it)
++    {
++      tree vtt_binfo = (vtbl_class_node->vtbl_map_subvttbinfos)[vtbl_it];
++      unsigned vtt_offset = tree_to_uhwi(BINFO_SUBVTT_INDEX (vtt_binfo));
++      vtt_offset = vtt_offset / sizeof(void*);
++      // Use class of sub-vtt to interpret the underlying VTT entries
++      tree type = TYPE_MAIN_VARIANT(BINFO_TYPE(vtt_binfo));
++      struct vtbl_map_node *vtbl_parent_node;
++      vtbl_parent_node = vtable_find_or_create_map_decl(type);
++      // Traverse all entries in the sub-VTT and see if they match the set
++      unsigned par_it;
++      unsigned par_it_end = (vtbl_parent_node->vtbl_map_vttoffsets).length();
++      for (par_it = 0; par_it < par_it_end; ++par_it)
+         {
+-          tree values = DECL_INITIAL (vtt_decl);
+-          if (TREE_ASM_WRITTEN (vtt_decl)
+-              && values != NULL_TREE
+-              && TREE_CODE (values) == CONSTRUCTOR
+-              && TREE_CODE (TREE_TYPE (values)) == ARRAY_TYPE)
+-            {
+-              unsigned HOST_WIDE_INT cnt;
+-              constructor_elt *ce;
+-
+-              /* Loop through the initialization values for this
+-                 vtable to get all the correct vtable pointer
+-                 addresses that we need to add to our set of valid
+-                 vtable pointers for the current base class.  This may
+-                 result in adding more than just the element assigned
+-                 to the primary vptr of the class, so we may end up
+-                 with more vtable pointers than are strictly
+-                 necessary.  */
+-
+-              for (cnt = 0;
+-                   vec_safe_iterate (CONSTRUCTOR_ELTS (values),
+-                                     cnt, &ce);
+-                   cnt++)
+-                {
+-                  tree value = ce->value;
+-
+-                  /* Search for the ADDR_EXPR operand within the value.  */
+-
+-                  while (value
+-                         && TREE_OPERAND (value, 0)
+-                         && TREE_CODE (TREE_OPERAND (value, 0)) == ADDR_EXPR)
+-                    value = TREE_OPERAND (value, 0);
+-
+-                  /* The VAR_DECL for the vtable should be the first
+-                     argument of the ADDR_EXPR, which is the first
+-                     argument of value.*/
+-
+-                  if (TREE_OPERAND (value, 0))
+-                    val_vtbl_decl = TREE_OPERAND (value, 0);
+-
+-                  while (TREE_CODE (val_vtbl_decl) != VAR_DECL
+-                         && TREE_OPERAND (val_vtbl_decl, 0))
+-                    val_vtbl_decl = TREE_OPERAND (val_vtbl_decl, 0);
+-
+-                  gcc_assert (TREE_CODE (val_vtbl_decl) == VAR_DECL);
+-
+-                  /* Check to see if we already have this vtable pointer in
+-                     our valid set for this base class.  */
+-
+-                  already_registered = check_and_record_registered_pairs
+-                                                               (val_vtbl_decl,
+-                                                                value,
+-                                                                base_class);
+-
+-                  if (already_registered)
+-                    continue;
+-
+-                  /* Add this vtable pointer to our set of valid
+-                     pointers for the base class.  */
+-
+-                  vtable_ptr_array->safe_push (value);
+-                  current_set_size++;
+-                }
+-            }
++          unsigned subvtt_offset = tree_to_uhwi((vtbl_parent_node->vtbl_map_vttoffsets)[par_it]);
++          subvtt_offset = subvtt_offset / sizeof(void*);
++          tree current_vtbl_parent;
++          current_vtbl_parent = (vtbl_parent_node->vtbl_map_vttparents)[par_it];
++          tree current_vtbl_binfo;
++          current_vtbl_binfo = (vtbl_parent_node->vtbl_map_vttbinfos)[par_it];
++          if (!find_vtable_match(base_class,
++                                 vtable_class,
++                                 type,
++                                 current_vtbl_parent,
++                                 current_vtbl_binfo))
++            continue;
++
++          ce = &((*(CONSTRUCTOR_ELTS (values)))[vtt_offset + subvtt_offset]);
++          tree value = ce->value;
++
++          /* Add this vtable pointer to our set of valid
++             pointers for the base class.  */
++
++          vtable_ptr_array->safe_push (value);
++          current_set_size++;
+         }
+     }
+ }
+@@ -600,37 +617,31 @@ register_construction_vtables (tree base_class, tree record_type,
+    added to the hierarchy.  */
+ 
+ static void
+-register_other_binfo_vtables (tree binfo, tree base_class,
++register_other_binfo_vtables (tree base_class,
++                              tree vtable_class, 
++                              struct vtbl_map_node *vtbl_desc_node,
+                               vec<tree> *vtable_ptr_array)
+ {
+-  unsigned ix;
+-  tree base_binfo;
+-  tree vtable_decl;
+-  bool already_registered;
+-
+-  if (binfo == NULL_TREE)
+-    return;
+-
+-  for (ix = 0; BINFO_BASE_ITERATE (binfo, ix, base_binfo); ix++)
++  // Traverse all VTables of descendant and check if they match set
++  unsigned it;
++  unsigned it_end = (vtbl_desc_node->vtbl_map_parents).length();
++  for (it = 0; it < it_end; ++it)
+     {
+-      if ((!BINFO_PRIMARY_P (base_binfo)
+-           || BINFO_VIRTUAL_P (base_binfo))
+-          && (vtable_decl = get_vtbl_decl_for_binfo (base_binfo)))
++      tree desc_vtable_class;
++      desc_vtable_class = (vtbl_desc_node->vtbl_map_parents)[it];
++      tree desc_vtable_binfo;
++      desc_vtable_binfo = (vtbl_desc_node->vtbl_map_binfos)[it];
++      bool found = find_vtable_match(base_class,
++                                     vtable_class,
++                                     vtbl_desc_node->class_info->class_type,
++                                     desc_vtable_class,
++                                     desc_vtable_binfo);
++      if (found)
+         {
+-          tree vtable_address = build_vtbl_address (base_binfo);
+-
+-          already_registered = check_and_record_registered_pairs
+-                                                              (vtable_decl,
+-                                                               vtable_address,
+-                                                               base_class);
+-          if (!already_registered)
+-            {
+-              vtable_ptr_array->safe_push (vtable_address);
+-              current_set_size++;
+-            }
++          tree vtable_address = build_vtbl_address (desc_vtable_binfo);
++          vtable_ptr_array->safe_push (vtable_address);
++          current_set_size++;
+         }
+-
+-      register_other_binfo_vtables (base_binfo, base_class, vtable_ptr_array);
+     }
+ }
+ 
+@@ -756,14 +767,14 @@ build_key_buffer_arg (tree base_ptr_var_decl)
+ }
+ 
+ static void
+-insert_call_to_register_set (tree class_name,
++insert_call_to_register_set (tree class_name, char *id,
+                              vec<tree> *vtbl_ptr_array, tree body, tree arg1,
+                              tree arg2, tree size_hint_arg)
+ {
+   tree call_expr;
+   int num_args = vtbl_ptr_array->length();
+   char *array_arg_name = ACONCAT (("__vptr_array_",
+-                                   IDENTIFIER_POINTER (class_name), NULL));
++                                   IDENTIFIER_POINTER (class_name), id, NULL));
+   tree array_arg_type = build_array_type_nelts (build_pointer_type
+                                                   (build_pointer_type
+                                                      (void_type_node)),
+@@ -907,6 +918,11 @@ register_all_pairs (tree body)
+       struct vtbl_map_node *current = vtbl_map_nodes_vec[j];
+       unsigned i = 0;
+       tree base_class = current->class_info->class_type;
++      // Traverse all unique parents of class to find correspoinding VTables
++      unsigned k;
++      for (k = 0; k < (current->vtbl_map_uniqueparents).length(); ++k)
++      {
++      tree vtable_class = (current->vtbl_map_uniqueparents)[k];
+       tree base_ptr_var_decl = current->vtbl_map_decl;
+       tree arg1;
+       tree arg2;
+@@ -940,16 +956,11 @@ register_all_pairs (tree body)
+             if (class_type
+                 && (TREE_CODE (class_type) == RECORD_TYPE))
+               {
+-                bool already_registered;
+-
+-                tree binfo = TYPE_BINFO (class_type);
+                 tree vtable_decl;
+                 bool vtable_should_be_output = false;
+ 
+                 vtable_decl = CLASSTYPE_VTABLES (class_type);
+ 
+-                /* Handle main vtable for this class.  */
+-
+                 if (vtable_decl)
+                   {
+                     vtable_should_be_output = TREE_ASM_WRITTEN (vtable_decl);
+@@ -958,28 +969,19 @@ register_all_pairs (tree body)
+ 
+                 if (vtable_decl && vtable_should_be_output)
+                   {
+-                    tree vtable_address = build_vtbl_address (binfo);
+-
+-                    already_registered = check_and_record_registered_pairs
+-                                                              (vtable_decl,
+-                                                               vtable_address,
+-                                                               base_class);
+-
+-
+-                    if (!already_registered)
+-                      {
+-                        vtbl_ptr_array->safe_push (vtable_address);
+-
+-                        /* Find and handle any 'extra' vtables associated
+-                           with this class, via virtual inheritance.   */
+-                        register_construction_vtables (base_class, class_type,
+-                                                       vtbl_ptr_array);
+-
+                         /* Find and handle any 'extra' vtables associated
+                            with this class, via multiple inheritance.   */
+-                        register_other_binfo_vtables (binfo, base_class,
++                        register_other_binfo_vtables (base_class,
++                                                      vtable_class,
++                                                      vtbl_class_node,
+                                                       vtbl_ptr_array);
+-                      }
++                        /* Find and handle any 'extra' vtables associated
++                           with this class, via virtual inheritance.   */
++                        register_construction_vtables (base_class, 
++                                                       vtable_class,
++                                                       class_type,
++                                                       vtbl_class_node,
++                                                       vtbl_ptr_array);
+                   }
+               }
+           }
+@@ -1018,7 +1020,9 @@ register_all_pairs (tree body)
+ 
+       if (vtbl_ptr_array->length() > 1)
+         {
+-          insert_call_to_register_set (current->class_name,
++          char temp_str[256];
++          sprintf(temp_str, "%d", k);
++          insert_call_to_register_set (current->class_name, temp_str,
+                                        vtbl_ptr_array, body, arg1, arg2,
+                                        size_hint_arg);
+           registered_at_least_one = true;
+@@ -1041,6 +1045,7 @@ register_all_pairs (tree body)
+         write_out_current_set_data (base_class, current_set_size);
+ 
+     }
++    }
+ 
+   return registered_at_least_one;
+ }
+@@ -1197,6 +1202,64 @@ vtv_generate_init_routine (void)
+   pop_lang_context ();
+ }
+ 
++/* Traverse the class hierarchy of a given class to accumulate information about
++   all its VTables.  */
++
++static void
++vtable_find_all_vtable_info(tree binfo, struct vtbl_map_node *vtable_map_node)
++{
++  unsigned ix;
++  tree base_binfo;
++
++  if (binfo == NULL_TREE)
++    return;
++  
++  // If binfo is part of VTT, track VTT entry
++  if (BINFO_VPTR_INDEX (binfo) != NULL_TREE)
++    {
++      unsigned i;
++      for (i = 0; i < (vtable_map_node->vtbl_map_vttoffsets).length(); ++i)
++        if ((vtable_map_node->vtbl_map_vttoffsets)[i] == BINFO_VPTR_INDEX (binfo))
++          break;
++      if (i == (vtable_map_node->vtbl_map_vttoffsets).length())
++        {
++          (vtable_map_node->vtbl_map_vttoffsets).safe_push(BINFO_VPTR_INDEX (binfo));
++          (vtable_map_node->vtbl_map_vttparents).safe_push(TYPE_MAIN_VARIANT(BINFO_TYPE(binfo)));
++          (vtable_map_node->vtbl_map_vttbinfos).safe_push(binfo);
++        }
++    }
++  
++  // Traverse all parents
++  for (ix = 0; BINFO_BASE_ITERATE (binfo, ix, base_binfo); ix++)
++    {
++      // Track parent if it is virtual or has corresping VTable
++      // Virtual parents with no explicit VTables have hidden virtual one
++      if (BINFO_VIRTUAL_P (base_binfo)
++           || (!BINFO_PRIMARY_P (base_binfo)
++           && BINFO_VTABLE (base_binfo)))
++        {
++            unsigned i;
++            for (i = 0; i < (vtable_map_node->vtbl_map_uniqueparents).length(); ++i)
++                if ((vtable_map_node->vtbl_map_uniqueparents)[i] == TYPE_MAIN_VARIANT(BINFO_TYPE(base_binfo)))
++                    break;
++            if (i == (vtable_map_node->vtbl_map_uniqueparents).length())
++              {
++                (vtable_map_node->vtbl_map_uniqueparents).safe_push(TYPE_MAIN_VARIANT(BINFO_TYPE(base_binfo)));
++                (vtable_map_node->vtbl_map_uniquebinfos).safe_push(base_binfo);
++              }
++            (vtable_map_node->vtbl_map_parents).safe_push(TYPE_MAIN_VARIANT(BINFO_TYPE(base_binfo)));
++            (vtable_map_node->vtbl_map_binfos).safe_push(base_binfo);
++        }
++      // Track sub-vtt entries, if they exists
++      if (BINFO_SUBVTT_INDEX (base_binfo) != NULL_TREE)
++      {
++        (vtable_map_node->vtbl_map_subvttbinfos).safe_push(base_binfo);
++      }
++      // Recursively cover parent classes
++      vtable_find_all_vtable_info(base_binfo, vtable_map_node);
++    }
++}
++
+ /* This funtion takes a tree containing a class type (BASE_TYPE), and
+    it either finds the existing vtbl_map_node for that class in our
+    data structure, or it creates a new node and adds it to the data
+@@ -1214,18 +1277,24 @@ vtable_find_or_create_map_decl (tree base_type)
+   if (!TYPE_BINFO (base_type) || !BINFO_VTABLE (TYPE_BINFO (base_type)))
+     return NULL;
+ 
+-  /* Create map lookup symbol for base class */
+-  var_name = get_mangled_vtable_map_var_name (base_type);
+-
+   /* We've already created the variable; just look it.  */
+-  vtable_map_node = vtbl_map_get_node (TYPE_MAIN_VARIANT (base_type));
++  vtable_map_node = find_or_create_vtbl_map_node (TYPE_MAIN_VARIANT (base_type));
+ 
+-  if (!vtable_map_node || (vtable_map_node->vtbl_map_decl == NULL_TREE))
++  if (vtable_map_node->vtbl_map_decl == NULL_TREE)
+     {
++      (vtable_map_node->vtbl_map_uniqueparents).safe_push(base_type);
++      (vtable_map_node->vtbl_map_uniquebinfos).safe_push(TYPE_BINFO (base_type));
++      (vtable_map_node->vtbl_map_parents).safe_push(base_type);
++      (vtable_map_node->vtbl_map_binfos).safe_push(TYPE_BINFO (base_type));
++      vtable_find_all_vtable_info(TYPE_BINFO(base_type), vtable_map_node);
++
+       /* If we haven't already created the *__vtable_map global
+-         variable for this class, do so now, and add it to the
++         variables for this class, do so now, and add it to the
+          varpool, to make sure it gets saved and written out.  */
+ 
++      /* Create map lookup symbol for base class */
++      var_name = get_mangled_vtable_map_var_name (base_type);
++
+       tree var_decl = NULL;
+       tree var_type = build_pointer_type (void_type_node);
+       tree initial_value = integer_zero_node;
+@@ -1255,11 +1324,8 @@ vtable_find_or_create_map_decl (tree base_type)
+       comdat_linkage (var_decl);
+ 
+       varpool_finalize_decl (var_decl);
+-      if (!vtable_map_node)
+-        vtable_map_node =
+-                   find_or_create_vtbl_map_node (TYPE_MAIN_VARIANT (base_type));
+-      if (vtable_map_node->vtbl_map_decl == NULL_TREE)
+-        vtable_map_node->vtbl_map_decl = var_decl;
++
++      vtable_map_node->vtbl_map_decl = var_decl;
+     }
+ 
+   gcc_assert (vtable_map_node);
+diff --git a/gcc/vtable-verify.c b/gcc/vtable-verify.c
+index b3cfa20..e94d5fd 100644
+--- a/gcc/vtable-verify.c
++++ b/gcc/vtable-verify.c
+@@ -385,6 +385,14 @@ find_or_create_vtbl_map_node (tree base_class_type)
+ 
+   node = XNEW (struct vtbl_map_node);
+   node->vtbl_map_decl = NULL_TREE;
++  (node->vtbl_map_uniqueparents).create (4);
++  (node->vtbl_map_uniquebinfos).create (4);
++  (node->vtbl_map_parents).create (4);
++  (node->vtbl_map_binfos).create (4);
++  (node->vtbl_map_subvttbinfos).create (4);
++  (node->vtbl_map_vttoffsets).create (4);
++  (node->vtbl_map_vttparents).create (4);
++  (node->vtbl_map_vttbinfos).create (4);
+   node->class_name = key.class_name;
+   node->uid = num_vtable_map_nodes++;
+ 
+diff --git a/gcc/vtable-verify.h b/gcc/vtable-verify.h
+index 14735b1..f946d6c 100644
+--- a/gcc/vtable-verify.h
++++ b/gcc/vtable-verify.h
+@@ -108,6 +108,14 @@ struct vtv_graph_node {
+ struct vtbl_map_node {
+   tree vtbl_map_decl;                 /* The var decl for the vtable map
+                                          variable.                          */
++  vec<tree> vtbl_map_uniqueparents;   /* List of unique parents (type)      */
++  vec<tree> vtbl_map_uniquebinfos;    /* List of unique parents (binfo)     */
++  vec<tree> vtbl_map_parents;         /* List of vtables (type)             */
++  vec<tree> vtbl_map_binfos;          /* List of vtables (binfos)           */
++  vec<tree> vtbl_map_subvttbinfos;    /* List of sub-vtt entries            */
++  vec<tree> vtbl_map_vttoffsets;      /* List of vtt entries (offset)       */
++  vec<tree> vtbl_map_vttparents;      /* List of vtt entries (type)         */
++  vec<tree> vtbl_map_vttbinfos;       /* List of vtt entries (binfos)       */
+   tree class_name;                    /* The DECL_ASSEMBLER_NAME of the
+                                          class.                             */
+   struct vtv_graph_node *class_info;  /* Our class hierarchy info for the
+-- 
+2.6.0
+

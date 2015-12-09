@@ -1,0 +1,88 @@
+VARIANT=vtv
+#VARIANT=llvm
+CC=g++
+CFLAGS=-fvtable-verify=std -rdynamic -Wl,-z,relro -std=c++0x -O0 -g -Wall -Werror -pipe 
+ifeq ($(VARIANT), llvm)
+    CC=clang++
+    CFLAGS=-fsanitize=cfi-vptr -flto -rdynamic -Wl,-z,relro -std=c++0x -O0 -g -Wall -Werror -pipe
+endif
+CODEGEN=codegenerator.exe
+TYPECHECKER=typechecker.py
+ILLEGALCHECKER=illegalchecker.py
+MAPCHECKER=mapchecker.exe
+MAPEVAL=mapeval.exe
+
+prepare:
+	mkdir -p autogen-sources
+	rm -f autogen-sources/*
+	mkdir -p autogen-exes-$(VARIANT)
+	rm -f autogen-exes-$(VARIANT)/*
+	./$(CODEGEN)
+
+zero:
+	for src in autogen-sources/*0.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+one:
+	for src in autogen-sources/*1.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+two:
+	for src in autogen-sources/*2.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+three:
+	for src in autogen-sources/*3.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+four:
+	for src in autogen-sources/*4.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+five:
+	for src in autogen-sources/*5.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+six:
+	for src in autogen-sources/*6.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+seven:
+	for src in autogen-sources/*7.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+eight:
+	for src in autogen-sources/*8.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+nine:
+	for src in autogen-sources/*9.cpp ; do \
+		$(CC) $(CFLAGS) $$src -o autogen-exes-$(VARIANT)/`basename $$src`.exe; \
+	done
+
+czero:
+	rm -f czero2.txt
+	for exe in autogen-exes-$(VARIANT)/* ; do \
+#		echo $$exe; \
+#		./$(TYPECHECKER) $$exe; \
+#		./$(ILLEGALCHECKER) $$exe $(VARIANT) >> czero2.txt; \
+		./$$exe > czero.txt; \
+		./$(MAPCHECKER) `nm $$exe | grep "T main" | cut -d " " -f1` < czero.txt 2>> czero2.txt; \
+	done
+	./$(MAPEVAL) < czero2.txt
+
+
+gen: zero one two three four five six seven eight nine
+
+check: czero
+
+

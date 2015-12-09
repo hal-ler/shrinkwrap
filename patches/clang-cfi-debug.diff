@@ -1,0 +1,68 @@
+Index: lib/Transforms/IPO/LowerBitSets.cpp
+===================================================================
+--- lib/Transforms/IPO/LowerBitSets.cpp	(revision 251286)
++++ lib/Transforms/IPO/LowerBitSets.cpp	(working copy)
+@@ -221,6 +221,8 @@
+   IntegerType *Int64Ty;
+   IntegerType *IntPtrTy;
+ 
++  DenseMap<Function *, uint64_t> PerFunctionIndex;
++
+   // The llvm.bitsets named metadata.
+   NamedMDNode *BitSetNM;
+ 
+@@ -475,6 +477,54 @@
+ 
+   Value *PtrAsInt = B.CreatePtrToInt(Ptr, IntPtrTy);
+ 
++if (BSI.Bits.size() >= 1)
++{
++    Function *CurrentFn = InitialBB->getParent();
++    if (PerFunctionIndex.count(CurrentFn) == 0)
++        PerFunctionIndex[CurrentFn] = 0;
++    FunctionType *MTy =
++      FunctionType::get(Int32Ty, std::vector<Type*>(1, PointerType::getUnqual(Int8Ty)), true);
++    auto PrintfFunc = dyn_cast<Function>(M->getOrInsertFunction("printf", MTy));
++    auto BitSetMDVal = dyn_cast<MetadataAsValue>(CI->getArgOperand(1));
++    auto BitSet = cast<MDString>(BitSetMDVal->getMetadata());
++    std::string VTableMapName = "VTVI" + BitSet->getString().str();
++    std::string VTableMapContentName = VTableMapName + "_array";
++    auto VTableMapContentVar = M->getGlobalVariable(VTableMapContentName);
++    if (!VTableMapContentVar) {
++        std::vector<Constant*> Addresses;
++        Addresses.push_back(ConstantInt::get(IntPtrTy, 0));
++        for (uint64_t bit : BSI.Bits)
++            Addresses.push_back(ConstantExpr::getAdd(ConstantInt::get(IntPtrTy, (bit << BSI.AlignLog2)), OffsetedGlobalAsInt));
++        auto VTableMapContent = ConstantVector::get(Addresses);
++        VTableMapContentVar = dyn_cast<GlobalVariable>(M->getOrInsertGlobal(VTableMapContentName, VTableMapContent->getType()));
++        VTableMapContentVar->setInitializer(VTableMapContent);
++        VTableMapContentVar->setConstant(true);
++    }
++    std::string VTableMapSizeName = VTableMapName + "_size";
++    auto VTableMapSizeVar = M->getGlobalVariable(VTableMapSizeName);
++    if (!VTableMapSizeVar) {
++        VTableMapSizeVar = dyn_cast<GlobalVariable>(M->getOrInsertGlobal(VTableMapSizeName, IntPtrTy));
++        VTableMapSizeVar->setInitializer(ConstantInt::get(IntPtrTy, BSI.Bits.size()));
++        VTableMapSizeVar->setConstant(true);
++    }
++    auto VTableMap = M->getGlobalVariable(VTableMapName);
++    if (!VTableMap) {
++        VTableMap = dyn_cast<GlobalVariable>(M->getOrInsertGlobal(VTableMapName, IntPtrTy));
++        VTableMap->setInitializer(ConstantExpr::getPtrToInt(VTableMapContentVar, IntPtrTy));
++    }
++    auto VTableMapVal = B.CreateLoad(VTableMap);
++    auto VTableMapSize = B.CreateLoad(VTableMapSizeVar);
++    std::vector<Value*> PrintArgs;
++    auto fmt = B.CreateGlobalStringPtr("%lx %lx %lx %d\n");
++    PrintArgs.push_back(fmt);
++    PrintArgs.push_back(ConstantExpr::getAdd(ConstantExpr::getPtrToInt(CurrentFn, IntPtrTy), ConstantInt::get(IntPtrTy, PerFunctionIndex[CurrentFn])));
++    PrintArgs.push_back(PtrAsInt);
++    PrintArgs.push_back(VTableMapVal);
++    PrintArgs.push_back(VTableMapSize);
++    B.CreateCall(PrintfFunc, PrintArgs, "trace");
++    PerFunctionIndex[CurrentFn] = PerFunctionIndex[CurrentFn] + 1;
++}
++
+   if (BSI.isSingleOffset())
+     return B.CreateICmpEQ(PtrAsInt, OffsetedGlobalAsInt);
+ 

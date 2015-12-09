@@ -1,0 +1,42 @@
+From ec0bc80aa5d921b5388cfc01fe79ab1ac401f233 Mon Sep 17 00:00:00 2001
+From: Istvan Haller <ihaller@ihr210-laptop.site>
+Date: Mon, 16 Feb 2015 15:25:06 +0100
+Subject: [PATCH 4/4] LibVTV extension for micro-benchark.
+
+---
+ libvtv/vtv_rts.cc | 5 +++++
+ libvtv/vtv_set.h  | 2 +-
+ 2 files changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/libvtv/vtv_rts.cc b/libvtv/vtv_rts.cc
+index 1af000d..8a66915 100644
+--- a/libvtv/vtv_rts.cc
++++ b/libvtv/vtv_rts.cc
+@@ -1346,6 +1346,11 @@ __VLTVerifyVtablePointer (void ** set_handle_ptr, const void * vtable_ptr)
+   else
+     handle_ptr = ptr_from_set_handle_handle (*set_handle_ptr);
+ 
++  void *callers[4];
++  backtrace (callers, 4);
++  printf("%p %p %p %d\n", callers[1], vtable_ptr, handle_ptr, 
++	(int)vtv_sets::size(handle_ptr));
++
+   if (!vtv_sets::contains (vtbl_ptr, handle_ptr))
+     {
+       __vtv_verify_fail ((void **) handle_ptr, vtable_ptr);
+diff --git a/libvtv/vtv_set.h b/libvtv/vtv_set.h
+index 6d0e3c9..8fb7cfe 100644
+--- a/libvtv/vtv_set.h
++++ b/libvtv/vtv_set.h
+@@ -435,7 +435,7 @@ class insert_only_hash_sets
+ 
+   /* Return the size of the given set.  */
+   static size_type
+-  size (const insert_only_hash_set **handle)
++  size (/* const */ insert_only_hash_set **handle)
+   { return insert_only_hash_set::size (*handle); }
+ 
+   static bool
+-- 
+2.6.0
+

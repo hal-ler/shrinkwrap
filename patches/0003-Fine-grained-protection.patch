@@ -1,0 +1,199 @@
+From d40c158946624aa86d6afe5a3dda2ccd0ed4abb1 Mon Sep 17 00:00:00 2001
+From: Istvan Haller <ihaller@ihr210-laptop.site>
+Date: Wed, 18 Feb 2015 13:15:48 +0100
+Subject: [PATCH 3/4] Fine-grained protection.
+
+---
+ gcc/cp/cp-tree.h                |  2 +-
+ gcc/cp/mangle.c                 |  6 ++++--
+ gcc/cp/vtable-class-hierarchy.c | 32 ++++++++++++++++++--------------
+ gcc/vtable-verify.c             | 18 ++++++++++++++----
+ gcc/vtable-verify.h             |  2 +-
+ 5 files changed, 38 insertions(+), 22 deletions(-)
+
+diff --git a/gcc/cp/cp-tree.h b/gcc/cp/cp-tree.h
+index 98e4c5a..43367b0 100644
+--- a/gcc/cp/cp-tree.h
++++ b/gcc/cp/cp-tree.h
+@@ -6190,7 +6190,7 @@ extern tree mangle_tls_init_fn			(tree);
+ extern tree mangle_tls_wrapper_fn		(tree);
+ extern bool decl_tls_wrapper_p			(tree);
+ extern tree mangle_ref_init_variable		(tree);
+-extern char * get_mangled_vtable_map_var_name   (tree);
++extern char * get_mangled_vtable_map_var_name   (tree, tree);
+ 
+ /* in dump.c */
+ extern bool cp_dump_tree			(void *, tree);
+diff --git a/gcc/cp/mangle.c b/gcc/cp/mangle.c
+index c8f57d3..10c0646 100644
+--- a/gcc/cp/mangle.c
++++ b/gcc/cp/mangle.c
+@@ -3907,7 +3907,7 @@ write_java_integer_type_codes (const tree type)
+ 
+ 
+ char *
+-get_mangled_vtable_map_var_name (tree class_type)
++get_mangled_vtable_map_var_name (tree class_type, tree vtable_type)
+ {
+   char *var_name = NULL;
+   const char *prefix = "_ZN4_VTVI";
+@@ -3916,13 +3916,15 @@ get_mangled_vtable_map_var_name (tree class_type)
+   gcc_assert (TREE_CODE (class_type) == RECORD_TYPE);
+ 
+   tree class_id = DECL_ASSEMBLER_NAME (TYPE_NAME (class_type));
++  tree vtable_id = DECL_ASSEMBLER_NAME (TYPE_NAME (vtable_type));
+   unsigned int len = strlen (IDENTIFIER_POINTER (class_id)) +
++                     strlen (IDENTIFIER_POINTER (vtable_id)) +
+                      strlen (prefix) +
+                      strlen (postfix) + 1;
+ 
+   var_name = (char *) xmalloc (len);
+ 
+-  sprintf (var_name, "%s%s%s", prefix, IDENTIFIER_POINTER (class_id), postfix);
++  sprintf (var_name, "%s%s%s%s", prefix, IDENTIFIER_POINTER (class_id), IDENTIFIER_POINTER (vtable_id), postfix);
+ 
+   return var_name;
+ }
+diff --git a/gcc/cp/vtable-class-hierarchy.c b/gcc/cp/vtable-class-hierarchy.c
+index 8303111..c7540fa 100644
+--- a/gcc/cp/vtable-class-hierarchy.c
++++ b/gcc/cp/vtable-class-hierarchy.c
+@@ -767,14 +767,15 @@ build_key_buffer_arg (tree base_ptr_var_decl)
+ }
+ 
+ static void
+-insert_call_to_register_set (tree class_name, char *id,
++insert_call_to_register_set (tree class_name, tree vtable_name,
+                              vec<tree> *vtbl_ptr_array, tree body, tree arg1,
+                              tree arg2, tree size_hint_arg)
+ {
+   tree call_expr;
+   int num_args = vtbl_ptr_array->length();
+   char *array_arg_name = ACONCAT (("__vptr_array_",
+-                                   IDENTIFIER_POINTER (class_name), id, NULL));
++                                   IDENTIFIER_POINTER (class_name),
++			           IDENTIFIER_POINTER (vtable_name), NULL));
+   tree array_arg_type = build_array_type_nelts (build_pointer_type
+                                                   (build_pointer_type
+                                                      (void_type_node)),
+@@ -923,7 +924,7 @@ register_all_pairs (tree body)
+       for (k = 0; k < (current->vtbl_map_uniqueparents).length(); ++k)
+       {
+       tree vtable_class = (current->vtbl_map_uniqueparents)[k];
+-      tree base_ptr_var_decl = current->vtbl_map_decl;
++      tree base_ptr_var_decl = (current->vtbl_map_decls)[k];
+       tree arg1;
+       tree arg2;
+       tree new_type;
+@@ -1020,9 +1021,8 @@ register_all_pairs (tree body)
+ 
+       if (vtbl_ptr_array->length() > 1)
+         {
+-          char temp_str[256];
+-          sprintf(temp_str, "%d", k);
+-          insert_call_to_register_set (current->class_name, temp_str,
++          insert_call_to_register_set (current->class_name, 
++			               DECL_ASSEMBLER_NAME(TYPE_NAME(vtable_class)),
+                                        vtbl_ptr_array, body, arg1, arg2,
+                                        size_hint_arg);
+           registered_at_least_one = true;
+@@ -1280,20 +1280,23 @@ vtable_find_or_create_map_decl (tree base_type)
+   /* We've already created the variable; just look it.  */
+   vtable_map_node = find_or_create_vtbl_map_node (TYPE_MAIN_VARIANT (base_type));
+ 
+-  if (vtable_map_node->vtbl_map_decl == NULL_TREE)
++  if ((vtable_map_node->vtbl_map_decls).length() == 0)
+     {
+       (vtable_map_node->vtbl_map_uniqueparents).safe_push(base_type);
+       (vtable_map_node->vtbl_map_uniquebinfos).safe_push(TYPE_BINFO (base_type));
+       (vtable_map_node->vtbl_map_parents).safe_push(base_type);
+       (vtable_map_node->vtbl_map_binfos).safe_push(TYPE_BINFO (base_type));
+       vtable_find_all_vtable_info(TYPE_BINFO(base_type), vtable_map_node);
++      unsigned i;
++      for (i = 0; i < (vtable_map_node->vtbl_map_uniqueparents).length(); ++i)
++        {
++          /* If we haven't already created the *__vtable_map global
++             variables for this class, do so now, and add it to the
++             varpool, to make sure it gets saved and written out.  */
+ 
+-      /* If we haven't already created the *__vtable_map global
+-         variables for this class, do so now, and add it to the
+-         varpool, to make sure it gets saved and written out.  */
+-
+-      /* Create map lookup symbol for base class */
+-      var_name = get_mangled_vtable_map_var_name (base_type);
++          /* Create map lookup symbol for base class+vtable */
++          var_name = get_mangled_vtable_map_var_name (base_type,
++                              (vtable_map_node->vtbl_map_uniqueparents)[i]);
+ 
+       tree var_decl = NULL;
+       tree var_type = build_pointer_type (void_type_node);
+@@ -1325,7 +1328,8 @@ vtable_find_or_create_map_decl (tree base_type)
+ 
+       varpool_finalize_decl (var_decl);
+ 
+-      vtable_map_node->vtbl_map_decl = var_decl;
++          (vtable_map_node->vtbl_map_decls).safe_push(var_decl);
++        }
+     }
+ 
+   gcc_assert (vtable_map_node);
+diff --git a/gcc/vtable-verify.c b/gcc/vtable-verify.c
+index e94d5fd..d02bc7b 100644
+--- a/gcc/vtable-verify.c
++++ b/gcc/vtable-verify.c
+@@ -384,7 +384,7 @@ find_or_create_vtbl_map_node (tree base_class_type)
+     return *slot;
+ 
+   node = XNEW (struct vtbl_map_node);
+-  node->vtbl_map_decl = NULL_TREE;
++  (node->vtbl_map_decls).create (4);
+   (node->vtbl_map_uniqueparents).create (4);
+   (node->vtbl_map_uniquebinfos).create (4);
+   (node->vtbl_map_parents).create (4);
+@@ -661,16 +661,26 @@ verify_bb_vtables (basic_block bb)
+ 
+               gcc_assert (verify_vtbl_ptr_fndecl);
+ 
++              /* Find the right vtable_map_decl */
++              unsigned i;
++              for (i = 0; i < (vtable_map_node->vtbl_map_uniqueparents).length(); ++i)
++              {
++                if ((vtable_map_node->vtbl_map_uniqueparents)[i] == vtable_type)
++                  break;
++              }
++              if ((vtable_map_node->vtbl_map_uniqueparents).length() > 0 && i < (vtable_map_node->vtbl_map_uniqueparents).length())
++              vtbl_var_decl = (vtable_map_node->vtbl_map_decls)[i];
++              else
++              vtbl_var_decl = NULL_TREE;
++
+               /* Given the vtable pointer for the base class of the
+                  object, build the call to __VLTVerifyVtablePointer to
+                  verify that the object's vtable pointer (contained in
+                  lhs) is in the set of valid vtable pointers for the
+                  base class.  */
+-
+-              if (vtable_map_node && vtable_map_node->vtbl_map_decl)
++              if (vtable_map_node && vtbl_var_decl)
+                 {
+                   vtable_map_node->is_used = true;
+-                  vtbl_var_decl = vtable_map_node->vtbl_map_decl;
+ 
+                   if (TREE_CODE (vtbl_decl) == VAR_DECL)
+                     vtable_name = IDENTIFIER_POINTER (DECL_NAME (vtbl_decl));
+diff --git a/gcc/vtable-verify.h b/gcc/vtable-verify.h
+index f946d6c..85d99a2 100644
+--- a/gcc/vtable-verify.h
++++ b/gcc/vtable-verify.h
+@@ -106,7 +106,7 @@ struct vtv_graph_node {
+    represent and find the vtable map nodes.  */
+ 
+ struct vtbl_map_node {
+-  tree vtbl_map_decl;                 /* The var decl for the vtable map
++  vec<tree> vtbl_map_decls;                 /* The var decl for the vtable map
+                                          variable.                          */
+   vec<tree> vtbl_map_uniqueparents;   /* List of unique parents (type)      */
+   vec<tree> vtbl_map_uniquebinfos;    /* List of unique parents (binfo)     */
+-- 
+2.6.0
+

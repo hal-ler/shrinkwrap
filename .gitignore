@@ -1,0 +1,5 @@
+*.exe
+classtester/obj/*
+classtester/autogen*
+classtester/czero.txt
+classtester/czero2.txt
