@@ -7,8 +7,8 @@ Paper found at : https://www.acsac.org/2015/openconf/modules/request.php?module=
 0001-Fixed-call-site-type-inference.patch : fixes call-site type inference in VTV (GCC 4.9.2).	
 0002-Extended-protection.patch : applies the extended policy to VTV (after patch 0001).  
 0003-Fine-grained-protection.patch : applies the fine-grained policy to VTV (after patch 0002).  
-0004-LibVTV-extension-for-micro-benchark.patch : generates debug output for VTV to be used with microbenchmark (GCC 4.9.2).  
-clang-cfi-debug.diff : generates debug output for CFI-VPTR to be used with microbenchmark (LLVM 3.8, not tested recently).  
+0004-LibVTV-extension-for-micro-benchark.patch : generates debug output for VTV (for microbenchmark) (GCC 4.9.2).  
+clang-cfi-debug.diff : generates debug output for CFI-VPTR (for microbenchmark) (LLVM 3.8, not tested recently).  
 
 ## Microbenchmark - classtester:  
 Build the microbenchmark using "make".  
