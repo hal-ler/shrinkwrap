@@ -5,8 +5,8 @@ Paper found at : https://www.acsac.org/2015/openconf/modules/request.php?module=
 
 Patches:  
 0001-Fixed-call-site-type-inference.patch : fixes call-site type inference in VTV (GCC 4.9.2).	
-0002-Extended-protection.patch : applies the VTV extension as presented in the ShrinkWrap paper (GCC 4.9.2, after patch 0001).  
-0003-Fine-grained-protection.patch : applies the fine-grained extension from the ShrinkWrap paper to VTV (GCC 4.9.2 after 0002).  
+0002-Extended-protection.patch : applies the extended policy to VTV (after patch 0001).  
+0003-Fine-grained-protection.patch : applies the fine-grained policy to VTV (after patch 0002).  
 0004-LibVTV-extension-for-micro-benchark.patch : generates debug output for VTV to be used with classtester (GCC 4.9.2).  
 clang-cfi-debug.diff : generates debug output for CFI-VPTR to be used with classtester (LLVM 3.8, not tested recently).  
 
