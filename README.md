@@ -1,7 +1,8 @@
 # ShrinkWrap
 Everything related to the ShrinkWrap paper from ACSAC 2015
 
-Paper found at : https://www.acsac.org/2015/openconf/modules/request.php?module=oc_program&action=summary.php&id=96
+Paper : https://www.acsac.org/2015/openconf/modules/request.php?module=oc_program&action=summary.php&id=96
+Archived PDF of paper: http://www.cs.vu.nl/~herbertb/papers/shrinkwrap_acsac2015.pdf
 
 ## Patches:  
 0001-Fixed-call-site-type-inference.patch : fixes call-site type inference in VTV (GCC 4.9.2).	
@@ -37,3 +38,16 @@ Configurations:
 ## Proof of concepts:  
 poc.cpp : attack hijacking vtable pointer protected by GCC VTV.  
 poc-clang-cfi.cpp : attack hijacking vtable pointer protected by Clang CFI-VPTR.  
+
+## Updating microbenchmark to support custom vtable protection  
+MAPCHECKER : Every check should print the following items on a line separated by spaces.  
+  * Instruction pointer at check/call-site (or another unique identifier for location).  
+  * Vtable pointer being used (or another unique identifier).  
+  * Pointer to allowed vtable set (or another unique identifier for set).  
+  * Size of allowed vtable set.  
+TYPECHECKER : Access a specifically named variable at every virtual call-site.
+  * VTV<classname> mangled C++ variable, where classname is the static class type of the call-site.
+  * Alternatively just update the script with specific static binary analysis.  
+ILLEGALCHECKER : Update the script to extract the information statically.  
+  * get_vtable_entries_X : Extract the vtable entries corresponding to a given set (identified by class index).  
+  * get_vtable_offset_X : Extract vtable offset used by a particular call-site.  
