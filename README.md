@@ -16,7 +16,8 @@ Build the microbenchmark using "make".
 Run the microbenchmark using:  
   * "make -f Makefile-gen prepare" : generate class hierarchies  
   * "make -f Makefile-gen gen": compiles all class hierarchies  
-  * "make -f Makefile-gen check": run time compiled class hierarchies and observe behavior
+  * "make -f Makefile-gen check": run time compiled class hierarchies and observe behavior  
+
 Configurations:  
   * codegenerator.cpp - defines  
     * CLASSES : maximum number of classes in the hierarchy (recommended =<6)  
@@ -44,10 +45,12 @@ MAPCHECKER : Every check should print the following items on a line separated by
   * Instruction pointer at check/call-site (or another unique identifier for location).  
   * Vtable pointer being used (or another unique identifier).  
   * Pointer to allowed vtable set (or another unique identifier for set).  
-  * Size of allowed vtable set.
+  * Size of allowed vtable set.  
+
 TYPECHECKER : Access a specifically named variable at every virtual call-site.
   * VTV<classname> mangled C++ variable, where classname is the static class type of the call-site.
   * Alternatively just update the script with specific static binary analysis.  
-ILLEGALCHECKER : Update the script to extract the information statically.
+
+ILLEGALCHECKER : Update the script to extract the information statically.  
   * get_vtable_entries_X : Extract the vtable entries corresponding to a given set (identified by class index).  
   * get_vtable_offset_X : Extract vtable offset used by a particular call-site.  
